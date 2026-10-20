@@ -1,5 +1,6 @@
 """Tkinter interface and user actions for Developer Launchpad."""
 
+import json
 import os
 import queue
 import threading
@@ -7,9 +8,17 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from command_profiles import create_profile, resolve_working_directory
+from command_runner import CommandEvent, CommandExecutionError, run_command
 from git_operations import GitOperations
 from integrations import find_vscode, open_explorer, open_terminal, open_vscode
-from storage import PROJECTS_FILE, load_projects, save_projects
+from storage import (
+    PROJECTS_FILE,
+    load_command_profiles,
+    load_projects,
+    save_command_profiles,
+    save_projects,
+)
 
 
 class DeveloperLaunchpad:
@@ -28,8 +37,17 @@ class DeveloperLaunchpad:
         self._visible_changes = []
         self._git_buttons = []
         self._project_controls = []
+        self._command_buttons = []
+        self._command_profiles = []
+        self._command_events = queue.Queue()
+        self._command_running = False
+        self._command_stop_requested = False
+        self._command_stop_event = None
+        self._command_thread = None
+        self._closing = False
         self.diff_mode = tk.StringVar(value="unstaged")
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_projects()
         self.root.after(100, self._poll_worker_results)
 
@@ -175,6 +193,63 @@ class DeveloperLaunchpad:
         fetch_button.grid(row=5, column=0, sticky="w")
         self._git_buttons.append(fetch_button)
 
+        commands_tab = ttk.Frame(git_tabs, padding=10)
+        git_tabs.add(commands_tab, text="Dev Commands")
+        commands_tab.columnconfigure(0, weight=1)
+        commands_tab.columnconfigure(1, weight=2)
+        commands_tab.rowconfigure(1, weight=1)
+        commands_tab.rowconfigure(2, weight=2)
+        ttk.Label(
+            commands_tab,
+            text="Commands run only when you select one and press Run. Configure commands only for trusted projects.",
+            wraplength=720,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        command_list_frame = ttk.LabelFrame(commands_tab, text="Project commands", padding=6)
+        command_list_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        self.command_list = tk.Listbox(command_list_frame, exportselection=False, font=("Segoe UI", 9))
+        command_scroll = ttk.Scrollbar(command_list_frame, orient="vertical", command=self.command_list.yview)
+        self.command_list.configure(yscrollcommand=command_scroll.set)
+        self.command_list.pack(side="left", fill="both", expand=True)
+        command_scroll.pack(side="right", fill="y")
+        self.command_list.bind("<<ListboxSelect>>", self.on_command_select)
+
+        command_details = ttk.LabelFrame(commands_tab, text="Command details", padding=8)
+        command_details.grid(row=1, column=1, sticky="nsew")
+        self.command_details_label = ttk.Label(command_details, text="Select or add a command profile.", wraplength=620, justify="left")
+        self.command_details_label.pack(fill="x", anchor="nw")
+        command_actions = ttk.Frame(command_details)
+        command_actions.pack(fill="x", pady=(8, 6))
+        for title, callback in (
+            ("Add", self.add_command_profile),
+            ("Edit", self.edit_command_profile),
+            ("Delete", self.delete_command_profile),
+            ("Run", self.run_selected_command),
+        ):
+            button = ttk.Button(command_actions, text=title, command=callback)
+            button.pack(side="left", padx=(0, 5))
+            self._command_buttons.append(button)
+
+        self.command_status = ttk.Label(command_details, text="No command is running.", wraplength=620)
+        self.command_status.pack(fill="x", anchor="w", pady=(3, 5))
+        output_controls = ttk.Frame(command_details)
+        output_controls.pack(fill="x")
+        self.stop_command_button = ttk.Button(output_controls, text="Stop", command=self.stop_running_command, state="disabled")
+        self.stop_command_button.pack(side="left")
+        clear_output_button = ttk.Button(output_controls, text="Clear output", command=self.clear_command_output)
+        clear_output_button.pack(side="left", padx=(6, 0))
+
+        command_output_frame = ttk.LabelFrame(commands_tab, text="Command output", padding=6)
+        command_output_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        command_output_frame.rowconfigure(0, weight=1)
+        command_output_frame.columnconfigure(0, weight=1)
+        self.command_output = tk.Text(command_output_frame, height=9, wrap="word", font=("Consolas", 9), state="disabled")
+        command_output_scroll = ttk.Scrollbar(command_output_frame, orient="vertical", command=self.command_output.yview)
+        self.command_output.configure(yscrollcommand=command_output_scroll.set)
+        self.command_output.grid(row=0, column=0, sticky="nsew")
+        command_output_scroll.grid(row=0, column=1, sticky="ns")
+        self.command_output.tag_configure("stderr", foreground="#a1260d")
+
         self.output = tk.Text(right, height=3, wrap="word", font=("Consolas", 9), state="disabled")
         self.output.pack(fill="x", pady=(8, 0))
 
@@ -233,6 +308,7 @@ class DeveloperLaunchpad:
         self.project_title.config(text=project["name"])
         self.project_path_label.config(text=project["path"])
         self.write_output(f"Selected project: {project['name']}\n\nChoose an action above.")
+        self.refresh_command_profiles(project)
         self.refresh_git()
 
     def add_project(self):
@@ -319,8 +395,7 @@ class DeveloperLaunchpad:
         if self._git_busy:
             return
         self._git_busy = True
-        for button in self._git_buttons + self._project_controls:
-            button.configure(state="disabled")
+        self._sync_busy_controls()
 
         def worker():
             try:
@@ -335,8 +410,7 @@ class DeveloperLaunchpad:
             while True:
                 on_success, result, on_error, error = self._worker_results.get_nowait()
                 self._git_busy = False
-                for button in self._git_buttons + self._project_controls:
-                    button.configure(state="normal")
+                self._sync_busy_controls()
                 if error is not None:
                     if on_error:
                         on_error(error)
@@ -347,7 +421,23 @@ class DeveloperLaunchpad:
                     on_success(result)
         except queue.Empty:
             pass
+        self._poll_command_events()
         self.root.after(100, self._poll_worker_results)
+
+    def _sync_busy_controls(self):
+        project_locked = self._git_busy or self._command_running
+        for control in self._project_controls:
+            control.configure(state="disabled" if project_locked else "normal")
+        for button in self._git_buttons:
+            button.configure(state="disabled" if self._git_busy else "normal")
+        for button in self._command_buttons:
+            button.configure(state="disabled" if self._command_running else "normal")
+        self.stop_command_button.configure(
+            state="normal" if self._command_running and not self._command_stop_requested else "disabled"
+        )
+        if self._git_busy:
+            for button in self._command_buttons:
+                button.configure(state="disabled")
 
     def refresh_git(self):
         folder = self.selected_project()
@@ -518,3 +608,336 @@ class DeveloperLaunchpad:
     def _after_git_change(self, message):
         self.write_output(message)
         self.refresh_git()
+
+    def refresh_command_profiles(self, project=None):
+        """Load the selected project's saved profiles without running any."""
+        if project is None:
+            selection = self.project_list.curselection()
+            if not selection:
+                self._command_profiles = []
+                self.command_list.delete(0, "end")
+                self.command_details_label.config(text="Select a project to manage its commands.")
+                return
+            project = self.projects[selection[0]]
+
+        self._command_profiles, warnings = load_command_profiles(project)
+        self.command_list.delete(0, "end")
+        for profile in self._command_profiles:
+            kind = "long-running" if profile.long_running else "task"
+            self.command_list.insert("end", f"{profile.name}  [{kind}]")
+        if warnings:
+            self.command_status.config(text=f"{len(warnings)} invalid saved profile(s) skipped; original data preserved.")
+        elif not self._command_running:
+            self.command_status.config(text="No command is running.")
+        if self._command_profiles:
+            self.command_list.selection_set(0)
+            self.on_command_select()
+        else:
+            self.command_details_label.config(text="No command profiles configured for this project.")
+
+    def on_command_select(self, _event=None):
+        selection = self.command_list.curselection()
+        if not selection:
+            return
+        profile = self._command_profiles[selection[0]]
+        project = self._selected_project_record()
+        if not project:
+            return
+        try:
+            effective_directory = resolve_working_directory(project["path"], profile.working_directory)
+        except ValueError as exc:
+            effective_directory = f"Invalid: {exc}"
+        arguments = json.dumps(list(profile.arguments), ensure_ascii=False)
+        kind = "Long-running process" if profile.long_running else "Task"
+        self.command_details_label.config(
+            text=(
+                f"{kind}: {profile.name}\n"
+                f"Executable: {profile.executable}\n"
+                f"Arguments: {arguments}\n"
+                f"Working directory: {effective_directory}\n"
+                f"Description: {profile.description or '(none)'}"
+            )
+        )
+
+    def _selected_command_profile(self):
+        selection = self.command_list.curselection()
+        if not selection:
+            messagebox.showinfo("Select a command", "Select a command profile first.")
+            return None
+        return self._command_profiles[selection[0]]
+
+    def _selected_project_record(self):
+        for project in self.projects:
+            if project.get("path") == self.selected_path:
+                return project
+        return None
+
+    def _save_current_command_profiles(self):
+        project = self._selected_project_record()
+        if project is None:
+            messagebox.showerror("Project unavailable", "Select a saved project before editing command profiles.")
+            return
+        save_command_profiles(project, self._command_profiles)
+        save_projects(self.projects)
+        self.refresh_command_profiles(project)
+
+    def _command_profile_dialog(self, initial=None):
+        """Show the editor; argument lines become separate argv entries."""
+        project = self._selected_project_record()
+        if project is None:
+            messagebox.showinfo("Select a project", "Select a project before configuring commands.")
+            return None
+        project_root = Path(project["path"]).resolve()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit command profile" if initial else "Add command profile")
+        dialog.geometry("680x570")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(1, weight=1)
+        result = []
+
+        def add_label(row, text):
+            ttk.Label(dialog, text=text).grid(row=row, column=0, sticky="nw", padx=(12, 10), pady=6)
+
+        add_label(0, "Display name")
+        name_entry = ttk.Entry(dialog)
+        name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=6)
+        name_entry.insert(0, initial.name if initial else "")
+
+        add_label(1, "Executable")
+        executable_entry = ttk.Entry(dialog)
+        executable_entry.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=6)
+        executable_entry.insert(0, initial.executable if initial else "")
+
+        add_label(2, "Arguments (one per line)")
+        argument_frame = ttk.Frame(dialog)
+        argument_frame.grid(row=2, column=1, sticky="nsew", padx=(0, 12), pady=6)
+        arguments_text = tk.Text(argument_frame, height=7, wrap="word")
+        argument_scroll = ttk.Scrollbar(argument_frame, orient="vertical", command=arguments_text.yview)
+        arguments_text.configure(yscrollcommand=argument_scroll.set)
+        arguments_text.pack(side="left", fill="both", expand=True)
+        argument_scroll.pack(side="right", fill="y")
+        if initial:
+            arguments_text.insert("1.0", "\n".join(initial.arguments))
+
+        add_label(3, "Working directory")
+        directory_frame = ttk.Frame(dialog)
+        directory_frame.grid(row=3, column=1, sticky="ew", padx=(0, 12), pady=6)
+        directory_entry = ttk.Entry(directory_frame)
+        directory_entry.pack(side="left", fill="x", expand=True)
+        directory_entry.insert(0, initial.working_directory if initial else ".")
+
+        def browse_directory():
+            try:
+                start = resolve_working_directory(project_root, directory_entry.get())
+            except ValueError:
+                start = project_root
+            selected = filedialog.askdirectory(parent=dialog, initialdir=str(start), title="Choose project working directory")
+            if not selected:
+                return
+            try:
+                relative = Path(selected).resolve().relative_to(project_root)
+            except ValueError:
+                messagebox.showerror("Outside project", "Choose a working directory inside the selected project.", parent=dialog)
+                return
+            directory_entry.delete(0, "end")
+            directory_entry.insert(0, relative.as_posix() if relative.parts else ".")
+
+        ttk.Button(directory_frame, text="Browse…", command=browse_directory).pack(side="left", padx=(6, 0))
+
+        add_label(4, "Description")
+        description_entry = ttk.Entry(dialog)
+        description_entry.grid(row=4, column=1, sticky="ew", padx=(0, 12), pady=6)
+        description_entry.insert(0, initial.description if initial else "")
+
+        long_running_var = tk.BooleanVar(dialog, value=initial.long_running if initial else False)
+        ttk.Checkbutton(dialog, text="Long-running process (for example, a development server)", variable=long_running_var).grid(
+            row=5, column=1, sticky="w", padx=(0, 12), pady=6
+        )
+        ttk.Label(
+            dialog,
+            text="Arguments are passed directly to the executable without a shell. Each non-empty line is one argument.",
+            wraplength=620,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 4))
+
+        def save_dialog():
+            try:
+                profile = create_profile(
+                    name_entry.get(),
+                    executable_entry.get(),
+                    arguments_text.get("1.0", "end-1c"),
+                    directory_entry.get(),
+                    long_running_var.get(),
+                    description_entry.get(),
+                    initial.profile_id if initial else None,
+                )
+                resolve_working_directory(project_root, profile.working_directory)
+            except ValueError as exc:
+                messagebox.showerror("Invalid command profile", str(exc), parent=dialog)
+                return
+            result.append(profile)
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", padx=12, pady=12)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="Save profile", command=save_dialog).pack(side="right")
+        name_entry.focus_set()
+        self.root.wait_window(dialog)
+        return result[0] if result else None
+
+    def _has_duplicate_command_name(self, candidate, excluding_id=None):
+        return any(
+            profile.profile_id != excluding_id and profile.name.casefold() == candidate.name.casefold()
+            for profile in self._command_profiles
+        )
+
+    def add_command_profile(self):
+        if self._command_running:
+            return
+        profile = self._command_profile_dialog()
+        if profile is None:
+            return
+        if self._has_duplicate_command_name(profile):
+            messagebox.showerror("Name already used", "Choose a unique command name for this project.")
+            return
+        self._command_profiles.append(profile)
+        self._save_current_command_profiles()
+        self.write_output(f"Saved command profile: {profile.name}. It will run only when you press Run.")
+
+    def edit_command_profile(self):
+        if self._command_running:
+            return
+        initial = self._selected_command_profile()
+        if initial is None:
+            return
+        profile = self._command_profile_dialog(initial)
+        if profile is None:
+            return
+        if self._has_duplicate_command_name(profile, excluding_id=initial.profile_id):
+            messagebox.showerror("Name already used", "Choose a unique command name for this project.")
+            return
+        self._command_profiles = [
+            profile if existing.profile_id == initial.profile_id else existing
+            for existing in self._command_profiles
+        ]
+        self._save_current_command_profiles()
+        self.write_output(f"Updated command profile: {profile.name}.")
+
+    def delete_command_profile(self):
+        if self._command_running:
+            return
+        profile = self._selected_command_profile()
+        if profile is None:
+            return
+        if not messagebox.askyesno("Delete command profile", f"Remove '{profile.name}' from this project? The command will not be run."):
+            return
+        self._command_profiles = [item for item in self._command_profiles if item.profile_id != profile.profile_id]
+        self._save_current_command_profiles()
+        self.write_output(f"Deleted command profile: {profile.name}.")
+
+    def run_selected_command(self):
+        if self._command_running:
+            return
+        profile = self._selected_command_profile()
+        project = self._selected_project_record()
+        if profile is None or project is None:
+            return
+        try:
+            working_directory = resolve_working_directory(project["path"], profile.working_directory)
+        except ValueError as exc:
+            messagebox.showerror("Invalid working directory", str(exc))
+            return
+
+        arguments = json.dumps(list(profile.arguments), ensure_ascii=False)
+        self._append_command_output(
+            f"\n--- Run requested ---\nExecutable: {profile.executable}\nArguments: {arguments}\n"
+            f"Working directory: {working_directory}\n"
+        )
+        self.command_status.config(text=f"Starting: {profile.name}…")
+        self._command_running = True
+        self._command_stop_requested = False
+        self._command_stop_event = threading.Event()
+        stop_event = self._command_stop_event
+        events = self._command_events
+        self._sync_busy_controls()
+
+        def worker():
+            try:
+                run_command(profile, working_directory, events, stop_event)
+            except CommandExecutionError as exc:
+                events.put(CommandEvent("error", text=str(exc)))
+            except Exception as exc:
+                events.put(CommandEvent("error", text=f"Command runner failed: {exc}"))
+
+        self._command_thread = threading.Thread(target=worker, name="launchpad-command", daemon=True)
+        self._command_thread.start()
+
+    def _poll_command_events(self):
+        try:
+            while True:
+                event = self._command_events.get_nowait()
+                if event.kind == "status":
+                    self.command_status.config(text=event.text)
+                elif event.kind == "started":
+                    self.command_status.config(text=f"Running (process ID {event.pid})")
+                elif event.kind == "output":
+                    self._append_command_output(event.text, stream=event.stream)
+                elif event.kind == "error":
+                    self.command_status.config(text="Failed to start")
+                    self._append_command_output(f"\nError: {event.text}\n", stream="stderr")
+                    messagebox.showerror("Command could not start", event.text)
+                    self._finish_command()
+                elif event.kind == "finished":
+                    if event.stopped:
+                        code = "unavailable" if event.returncode is None else str(event.returncode)
+                        self.command_status.config(text=f"Stopped by user (exit code {code})")
+                    elif event.returncode == 0:
+                        self.command_status.config(text="Completed successfully (exit code 0)")
+                    else:
+                        self.command_status.config(text=f"Failed (exit code {event.returncode})")
+                    self._append_command_output(f"\n--- {self.command_status.cget('text')} ---\n")
+                    self._finish_command()
+        except queue.Empty:
+            pass
+
+    def _finish_command(self):
+        self._command_running = False
+        self._command_stop_requested = False
+        self._command_stop_event = None
+        self._command_thread = None
+        self._sync_busy_controls()
+        if self._closing:
+            self.root.destroy()
+
+    def _append_command_output(self, text, stream=None):
+        self.command_output.configure(state="normal")
+        tag = stream if stream == "stderr" else ()
+        self.command_output.insert("end", text, tag)
+        self.command_output.see("end")
+        self.command_output.configure(state="disabled")
+
+    def clear_command_output(self):
+        self._set_text(self.command_output, "")
+
+    def stop_running_command(self):
+        if not self._command_running or self._command_stop_event is None or self._command_stop_requested:
+            return
+        self._command_stop_requested = True
+        self.command_status.config(text="Stop requested; terminating the process tree…")
+        self._command_stop_event.set()
+        self._sync_busy_controls()
+
+    def on_close(self):
+        if not self._command_running:
+            self._closing = True
+            self.root.destroy()
+            return
+        if not messagebox.askyesno(
+            "Command still running",
+            "Stop the running command and its child processes before closing Developer Launchpad?",
+        ):
+            return
+        self._closing = True
+        self.stop_running_command()
+        self.command_status.config(text="Stopping command before closing…")
