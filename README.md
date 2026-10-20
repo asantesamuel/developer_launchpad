@@ -6,8 +6,12 @@ Developer Launchpad is a small Windows desktop helper for managing project short
 
 - Save project folder shortcuts in your user profile.
 - Open a selected project in VS Code, PowerShell, or File Explorer.
-- View Git branch/status and the five most recent commits.
-- Review changed file names and confirm before staging all changes and creating a commit.
+- View the current branch, upstream, ahead/behind counts, and working-tree summary.
+- Review staged, unstaged, untracked, deleted, and renamed files and inspect staged or unstaged diffs.
+- Stage or unstage only the selected files.
+- Create and switch local branches with a local-change warning.
+- Fetch from a configured remote without pulling, merging, rebasing, or pushing.
+- Commit staged changes only.
 
 ## Requirements
 
@@ -27,7 +31,7 @@ python main.py
 
 You can also open the folder in VS Code and run `main.py`, or continue using the old command `python developer_launchpad.py` (it forwards to the same entry point). If your Python Launcher is configured, `py main.py` works too.
 
-The saved project list is stored at `%USERPROFILE%\.developer_launchpad\projects.json`. Removing a project in the app removes only its shortcut. The Git commit action stages all changes only after showing the current file list and asking for confirmation.
+The saved project list is stored at `%USERPROFILE%\.developer_launchpad\projects.json`. Removing a project in the app removes only its shortcut.
 
 ## Project layout
 
@@ -35,11 +39,28 @@ The saved project list is stored at `%USERPROFILE%\.developer_launchpad\projects
 - `app.py` builds the window and handles button actions.
 - `storage.py` reads and writes the saved project shortcuts.
 - `integrations.py` locates VS Code and runs Git or Windows launch commands.
+- `git_operations.py` contains testable Git status, diff, staging, branch, fetch, and commit operations.
+- `tests/test_git_operations.py` exercises Git workflows in disposable local repositories.
 - `developer_launchpad.py` remains as a compatibility launcher for the original filename.
 
 ## Add an automation
 
-Put tool-specific work in `integrations.py` (or a focused new module if it grows), then add a clearly named method to `DeveloperLaunchpad` in `app.py` that checks the selected project, calls that helper, and reports the result. Add a button in `_build_ui()` to connect the method to the interface. Keep UI prompts and messages in `app.py`; keep file persistence in `storage.py`.
+Put a Git workflow in `git_operations.py` so it can be tested without starting the GUI. Add a clearly named handler in `DeveloperLaunchpad` in `app.py`, connect it to a button in `_build_ui()`, and use `_submit_git()` for work that may take time. Keep UI prompts and messages in `app.py`; keep file persistence in `storage.py`.
+
+## Git workflow
+
+1. Select a project and open **Overview**. The app shows its branch, upstream tracking state, and counts for staged, unstaged, and untracked files. Use **Refresh** to update it.
+2. Open **Changes & Commit**. Select one or more file rows; use **Unstaged** or **Staged** to inspect the corresponding diff. **Stage selected** and **Unstage selected** affect only selected paths.
+3. Review the staged-file list, enter a commit message, and choose **Commit staged changes**. Unstaged and untracked files are not automatically added.
+4. Open **Branches & Fetch** to create a branch, switch to a local branch, or fetch from the configured `origin` remote (or the first configured remote when there is no `origin`). Fetch updates remote-tracking information only; it does not integrate changes.
+
+The app warns before attempting a branch switch when the working tree has local changes. A normal `git switch` is used without force; Git can carry compatible changes and refuses a conflicting switch. No reset, clean, forced switch, push, merge, or rebase command is used.
+
+Run the automated checks with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ## Troubleshooting
 
@@ -49,3 +70,5 @@ Put tool-specific work in `integrations.py` (or a focused new module if it grows
 - **A project folder is missing**: use the app to remove its stale shortcut and add the folder again when available.
 - **The saved list cannot be read**: the app warns and starts with an empty in-memory list; the original JSON is left in place. Back it up before repairing it manually.
 - **A commit fails after staging**: inspect Git status before retrying, because staging may have completed even though the commit did not.
+- **No upstream is shown**: configure an upstream for that branch in Git; the app does not change remote or upstream configuration.
+- **Fetch fails**: verify the remote exists, network access works, and your Git credentials are available. Fetch never merges the fetched changes.
