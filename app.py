@@ -13,6 +13,20 @@ from command_runner import CommandEvent, CommandExecutionError, run_command
 from diagnostics import install_tk_exception_handler, log_error
 from git_operations import GitOperations
 from integrations import find_vscode, open_explorer, open_terminal, open_vscode
+from github_publishing import (
+    GitHubCLIError,
+    GitHubPublisher,
+    PublishError,
+    validate_description,
+    validate_repository_name,
+)
+from project_creation import (
+    ProjectCreationError,
+    create_initial_commit,
+    create_project,
+    preview_project_path,
+    validate_project_name,
+)
 from project_catalog import (
     ALL_CATEGORIES,
     ALL_TAGS,
@@ -35,6 +49,11 @@ from storage import (
 )
 
 
+def _yes_no_unknown(value):
+    """Render a three-state external-operation result without guessing."""
+    return "unknown (operation may have timed out)" if value is None else ("yes" if value else "no")
+
+
 class DeveloperLaunchpad:
     """Main application window and its project-management actions."""
 
@@ -51,6 +70,9 @@ class DeveloperLaunchpad:
 
         self.selected_path = None
         self._worker_results = queue.Queue()
+        self._project_progress_events = queue.Queue()
+        self._creation_progress_label = None
+        self._project_work_active = False
         self._git_busy = False
         self._visible_changes = []
         self._git_buttons = []
@@ -88,6 +110,7 @@ class DeveloperLaunchpad:
         menu = tk.Menu(self.root)
         project_menu = tk.Menu(menu, tearoff=False)
         project_menu.add_command(label="Add project…", accelerator="Ctrl+N", command=self.add_project)
+        project_menu.add_command(label="Create New Project…", command=self.open_create_project_dialog)
         project_menu.add_command(label="Edit project labels…", command=self.edit_project_labels)
         project_menu.add_command(label="Remove project shortcut…", command=self.remove_project)
         project_menu.add_separator()
@@ -159,6 +182,9 @@ class DeveloperLaunchpad:
         self.manage_labels_button = ttk.Button(left, text="Manage categories and tags…", command=self.manage_labels)
         self.manage_labels_button.grid(row=10, column=0, sticky="ew", pady=(6, 0))
         self._project_controls.extend([self.add_project_button, self.edit_labels_button, self.remove_project_button, self.manage_labels_button])
+        self.create_project_button = ttk.Button(left, text="Create New Project…", command=self.open_create_project_dialog)
+        self.create_project_button.grid(row=11, column=0, sticky="ew", pady=(6, 0))
+        self._project_controls.append(self.create_project_button)
 
         heading = ttk.Frame(right)
         heading.grid(row=0, column=0, sticky="ew")
@@ -497,6 +523,417 @@ class DeveloperLaunchpad:
             self.projects.remove(project)
             return
         self.refresh_projects(select_path=path)
+
+    def open_create_project_dialog(self):
+        """Collect project-creation choices; no disk changes happen until confirm."""
+        if self._git_busy or self._command_running:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Create New Project")
+        dialog.geometry("650x480")
+        dialog.minsize(560, 430)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(1, weight=1)
+        dialog.rowconfigure(8, weight=1)
+
+        documents = Path.home() / "Documents"
+        default_parent = documents if documents.is_dir() else Path.home()
+        name_var = tk.StringVar(dialog)
+        parent_var = tk.StringVar(dialog, value=str(default_parent))
+        readme_var = tk.BooleanVar(dialog, value=True)
+        gitignore_var = tk.BooleanVar(dialog, value=True)
+        commit_var = tk.BooleanVar(dialog, value=True)
+        preview_var = tk.StringVar(dialog, value="Choose a project name and parent folder.")
+        ttk.Label(dialog, text="Create a new local project", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(14, 8)
+        )
+        ttk.Label(dialog, text="Project name (Windows folder name)").grid(row=1, column=0, sticky="w", padx=14, pady=5)
+        name_entry = ttk.Entry(dialog, textvariable=name_var)
+        name_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 14), pady=5)
+        ttk.Label(dialog, text="Parent directory").grid(row=2, column=0, sticky="w", padx=14, pady=5)
+        parent_entry = ttk.Entry(dialog, textvariable=parent_var)
+        parent_entry.grid(row=2, column=1, sticky="ew", padx=(0, 6), pady=5)
+
+        def browse_parent():
+            selected = filedialog.askdirectory(
+                parent=dialog, initialdir=parent_var.get(), title="Choose parent directory"
+            )
+            if selected:
+                parent_var.set(selected)
+
+        browse_button = ttk.Button(dialog, text="Browse…", command=browse_parent)
+        browse_button.grid(row=2, column=2, sticky="ew", padx=(0, 14), pady=5)
+        ttk.Label(dialog, text="Destination preview").grid(row=3, column=0, sticky="nw", padx=14, pady=5)
+        preview_label = ttk.Label(dialog, textvariable=preview_var, wraplength=460, justify="left")
+        preview_label.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 14), pady=5)
+        ttk.Label(dialog, text="Starter content").grid(row=4, column=0, sticky="nw", padx=14, pady=5)
+        options = ttk.Frame(dialog)
+        options.grid(row=4, column=1, columnspan=2, sticky="w", padx=(0, 14), pady=5)
+        readme_check = ttk.Checkbutton(options, text="Create README.md", variable=readme_var)
+        readme_check.pack(anchor="w")
+        gitignore_check = ttk.Checkbutton(options, text="Create a conservative .gitignore", variable=gitignore_var)
+        gitignore_check.pack(anchor="w")
+        commit_check = ttk.Checkbutton(options, text="Create an initial commit from generated files", variable=commit_var)
+        commit_check.pack(anchor="w")
+        ttk.Label(
+            dialog,
+            text="README.md starts with the project name. .gitignore excludes common generated files and local secrets; its full contents are documented in the project README.",
+            wraplength=590, justify="left", style="Muted.TLabel",
+        ).grid(row=5, column=0, columnspan=3, sticky="ew", padx=14, pady=(5, 3))
+        ttk.Label(
+            dialog,
+            text="Git records only files you authorize. The initial commit stages only the selected generated starter files. The project folder is never deleted automatically if a later step fails.",
+            wraplength=590, justify="left",
+        ).grid(row=6, column=0, columnspan=3, sticky="ew", padx=14, pady=4)
+        progress_label = ttk.Label(dialog, text="No files or folders will be created until you confirm.", wraplength=590)
+        progress_label.grid(row=7, column=0, columnspan=3, sticky="ew", padx=14, pady=8)
+
+        def update_preview(*_args):
+            if not (readme_var.get() or gitignore_var.get()):
+                commit_var.set(False)
+                commit_check.configure(state="disabled")
+            else:
+                commit_check.configure(state="normal")
+            try:
+                destination = preview_project_path(parent_var.get(), name_var.get())
+                suffix = " — already exists; creation will be refused" if destination.exists() else ""
+                preview_var.set(f"{destination}{suffix}")
+            except (ValueError, OSError) as exc:
+                preview_var.set(f"Destination unavailable: {exc}")
+
+        name_var.trace_add("write", update_preview)
+        parent_var.trace_add("write", update_preview)
+        readme_var.trace_add("write", update_preview)
+        gitignore_var.trace_add("write", update_preview)
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=8, column=0, columnspan=3, sticky="ew", padx=14, pady=(8, 14))
+        buttons.columnconfigure(0, weight=1)
+        create_button = ttk.Button(buttons, text="Create project…")
+        create_button.grid(row=0, column=1, padx=(0, 6))
+        cancel_button = ttk.Button(buttons, text="Cancel", command=dialog.destroy)
+        cancel_button.grid(row=0, column=2)
+
+        def submit_creation():
+            try:
+                validate_project_name(name_var.get())
+                destination = preview_project_path(parent_var.get(), name_var.get())
+                if destination.exists() or destination.is_symlink():
+                    raise FileExistsError(f"This destination already exists and will not be overwritten:\n{destination}")
+                if commit_var.get() and not (readme_var.get() or gitignore_var.get()):
+                    raise ValueError("An initial commit requires at least one generated starter file.")
+            except (ValueError, FileExistsError, OSError) as exc:
+                messagebox.showerror("Cannot create project", str(exc), parent=dialog)
+                return
+            files = []
+            if readme_var.get():
+                files.append("README.md")
+            if gitignore_var.get():
+                files.append(".gitignore")
+            commit_explanation = (
+                "The initial commit will record only: " + ", ".join(files)
+                if commit_var.get() else "No initial commit will be created; the local repository may have no commits."
+            )
+            if not messagebox.askyesno(
+                "Confirm project creation",
+                f"Create this new project?\n\n{destination}\n\n{commit_explanation}\n\n"
+                "The destination must remain new. Once creation starts, the app will not delete partial work automatically.",
+                parent=dialog,
+            ):
+                return
+            for control in (
+                name_entry, parent_entry, browse_button, readme_check,
+                gitignore_check, commit_check, create_button, cancel_button,
+            ):
+                control.configure(state="disabled")
+            progress_label.config(text="Creating project… This operation cannot be safely cancelled once it begins.")
+            self._creation_progress_label = progress_label
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+            project_name = name_var.get()
+            parent_directory = parent_var.get()
+            generate_readme = readme_var.get()
+            generate_gitignore = gitignore_var.get()
+            make_initial_commit = commit_var.get()
+
+            def work():
+                return create_project(
+                    project_name,
+                    parent_directory,
+                    create_readme=generate_readme,
+                    create_gitignore=generate_gitignore,
+                    initial_commit=make_initial_commit,
+                    progress=self._project_progress_events.put,
+                )
+
+            def created(result):
+                self._project_work_active = False
+                self._creation_progress_label = None
+                dialog.destroy()
+                if not self._register_created_project(result.name, result.path):
+                    messagebox.showwarning(
+                        "Project created but not saved",
+                        f"The project is on disk at:\n{result.path}\n\nIt could not be added to the saved Launchpad list. Use Add to save it later.",
+                    )
+                    return
+                self.write_output(f"Local project created and Git initialized:\n{result.path}")
+                self._ask_about_publishing(result)
+
+            def creation_failed(error):
+                self._project_work_active = False
+                self._creation_progress_label = None
+                dialog.destroy()
+                if isinstance(error, ProjectCreationError) and error.folder_created and error.path.is_dir():
+                    self._register_created_project(error.path.name, error.path)
+                log_error("Creating new project", error)
+                messagebox.showerror("Project creation incomplete", str(error))
+                if isinstance(error, ProjectCreationError) and error.folder_created and error.path.is_dir():
+                    self._offer_open_created_project(error.path)
+
+            self._project_work_active = True
+            self._submit_git(work, created, creation_failed)
+
+        create_button.configure(command=submit_creation)
+        name_entry.focus_set()
+
+    def _register_created_project(self, name, path):
+        """Save/select a newly created folder without duplicating its shortcut."""
+        path = str(Path(path).resolve())
+        existing = None
+        for project in self.projects:
+            saved_path = project.get("path")
+            if not isinstance(saved_path, str):
+                continue
+            try:
+                if Path(saved_path).expanduser().resolve() == Path(path):
+                    existing = project
+                    break
+            except (OSError, RuntimeError, ValueError):
+                continue
+        if existing:
+            self.refresh_projects(select_path=path)
+            return True
+        try:
+            project = add_project_shortcut(self.projects, name, path)
+        except (ValueError, OSError) as exc:
+            log_error("Adding created project shortcut", exc)
+            return False
+        self.projects.append(project)
+        if not self._persist_projects():
+            self.projects.remove(project)
+            return False
+        self.refresh_projects(select_path=path)
+        return True
+
+    def _ask_about_publishing(self, result):
+        answer = messagebox.askyesnocancel(
+            "Project created",
+            "Would you like to publish this project to GitHub?\n\n"
+            "Yes: check GitHub CLI authentication and review repository settings.\n"
+            "No: keep the repository local; no network operation will run.\n"
+            "Cancel: decide later; the project remains local.",
+        )
+        if answer is True:
+            self._check_github_auth(result)
+        else:
+            self._offer_open_created_project(result.path)
+
+    def _check_github_auth(self, result):
+        publisher = GitHubPublisher()
+        self.write_output("Checking GitHub CLI installation and authentication…")
+
+        def authenticated(_value):
+            self._project_work_active = False
+            self._open_github_publish_dialog(result, publisher)
+
+        def unavailable(error):
+            self._project_work_active = False
+            log_error("Checking GitHub CLI authentication", error)
+            messagebox.showerror("GitHub publishing unavailable", str(error))
+            self._offer_open_created_project(result.path)
+
+        self._project_work_active = True
+        self._submit_git(lambda: publisher.check_authentication(result.path), authenticated, unavailable)
+
+    def _open_github_publish_dialog(self, result, publisher):
+        """Review remote settings and obtain explicit confirmation before publish."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Publish to GitHub")
+        dialog.geometry("620x420")
+        dialog.minsize(540, 380)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(1, weight=1)
+        repository_var = tk.StringVar(dialog, value=result.name)
+        description_var = tk.StringVar(dialog)
+        visibility_var = tk.StringVar(dialog, value="private")
+        ttk.Label(dialog, text="Review GitHub repository settings", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(14, 10)
+        )
+        ttk.Label(dialog, text="Repository name").grid(row=1, column=0, sticky="w", padx=14, pady=6)
+        repo_entry = ttk.Entry(dialog, textvariable=repository_var)
+        repo_entry.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=6)
+        ttk.Label(dialog, text="Description (optional)").grid(row=2, column=0, sticky="w", padx=14, pady=6)
+        description_entry = ttk.Entry(dialog, textvariable=description_var)
+        description_entry.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=6)
+        ttk.Label(dialog, text="Visibility").grid(row=3, column=0, sticky="w", padx=14, pady=6)
+        visibility = ttk.Combobox(dialog, textvariable=visibility_var, values=("private", "public"), state="readonly", width=16)
+        visibility.grid(row=3, column=1, sticky="w", padx=(0, 14), pady=6)
+        visibility_note = ttk.Label(dialog, wraplength=470, justify="left")
+        visibility_note.grid(row=4, column=1, sticky="ew", padx=(0, 14), pady=(0, 7))
+
+        def update_visibility(*_args):
+            if visibility_var.get() == "public":
+                visibility_note.config(text="Public repositories can be viewed by other people. Confirm carefully before publishing.")
+            else:
+                visibility_note.config(text="Private repositories are restricted according to GitHub's access rules.")
+
+        visibility_var.trace_add("write", update_visibility)
+        update_visibility()
+        ttk.Label(dialog, text="Local project").grid(row=5, column=0, sticky="nw", padx=14, pady=6)
+        ttk.Label(dialog, text=str(result.path), wraplength=450, justify="left").grid(row=5, column=1, sticky="ew", padx=(0, 14), pady=6)
+        commit_description = (
+            f"Initial commit to publish: {result.initial_commit_hash}"
+            if result.initial_commit_hash else "No initial commit exists. Publishing requires you to explicitly create one from the generated starter files."
+        )
+        ttk.Label(dialog, text=commit_description, wraplength=580, justify="left").grid(
+            row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=7
+        )
+        ttk.Label(
+            dialog,
+            text="Publishing creates a new GitHub repository, adds origin only if none exists, pushes the current branch without force, and verifies the remote commit. Existing remote repositories are never reused or overwritten.",
+            wraplength=580, justify="left", style="Muted.TLabel",
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", padx=14, pady=7)
+        status_label = ttk.Label(dialog, text="No network operation has started.", wraplength=580)
+        status_label.grid(row=8, column=0, columnspan=2, sticky="ew", padx=14, pady=6)
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=9, column=0, columnspan=2, sticky="e", padx=14, pady=(8, 14))
+        publish_button = ttk.Button(buttons, text="Publish")
+        cancel_button = ttk.Button(buttons, text="Cancel", command=dialog.destroy)
+
+        def confirm_publish():
+            try:
+                repository_name = validate_repository_name(repository_var.get())
+                description = validate_description(description_var.get())
+            except ValueError as exc:
+                messagebox.showerror("Invalid repository settings", str(exc), parent=dialog)
+                return
+            visibility_value = visibility_var.get()
+            if visibility_value not in ("private", "public"):
+                messagebox.showerror("Choose visibility", "Choose Private or Public.", parent=dialog)
+                return
+            if not messagebox.askyesno(
+                "Confirm GitHub publication",
+                f"Create a {visibility_value.upper()} GitHub repository named '{repository_name}'?\n\n"
+                f"Description: {description or '(none)'}\nLocal folder: {result.path}\n"
+                f"Initial commit: {result.initial_commit_hash or 'create from generated starter files'}\n\n"
+                "This will create a new remote and push the current branch. No existing remote will be replaced.",
+                parent=dialog,
+            ):
+                return
+
+            needs_commit = result.initial_commit_hash is None
+            if needs_commit:
+                if not result.generated_files:
+                    messagebox.showerror(
+                        "Cannot publish without a commit",
+                        "This empty project has no generated files to commit. Cancel publishing, create files, then stage and commit them using the Git tools before trying again.",
+                        parent=dialog,
+                    )
+                    return
+                if not messagebox.askyesno(
+                    "Initial commit required",
+                    "GitHub needs a commit to publish. Create an initial commit from only these generated files?\n\n"
+                    + "\n".join(result.generated_files)
+                    + "\n\nNo other files will be staged.",
+                    parent=dialog,
+                ):
+                    return
+
+            for control in (repo_entry, description_entry, visibility, publish_button, cancel_button):
+                control.configure(state="disabled")
+            status_label.config(text="Publishing… This operation cannot be reliably cancelled after GitHub creates the remote.")
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+            self._creation_progress_label = status_label
+
+            def publish_work():
+                commit_hash = result.initial_commit_hash
+                if needs_commit:
+                    self._project_progress_events.put("Creating initial commit from generated starter files…")
+                    commit_hash = create_initial_commit(result.path, result.generated_files)
+                return publisher.publish(
+                    result.path, repository_name, description, visibility_value,
+                    progress=self._project_progress_events.put,
+                )
+
+            def published(state):
+                self._project_work_active = False
+                self._creation_progress_label = None
+                dialog.destroy()
+                self.write_output(f"GitHub publication verified: {state.url}")
+                messagebox.showinfo(
+                    "Project published and verified",
+                    f"Repository: {state.url}\n\nThe origin remote and pushed branch were verified against the local commit.",
+                )
+                self._offer_open_created_project(result.path)
+
+            def publish_failed(error):
+                self._project_work_active = False
+                self._creation_progress_label = None
+                dialog.destroy()
+                log_error("Publishing project to GitHub", error)
+                if isinstance(error, ProjectCreationError):
+                    title = "Initial commit failed; publishing not started"
+                    message = str(error) + "\n\nNo GitHub repository was requested and no push was attempted."
+                elif isinstance(error, PublishError):
+                    title = "GitHub publication incomplete"
+                    state = error.state
+                    detail = (
+                        f"\n\nRemote repository created: {_yes_no_unknown(state.remote_created)}"
+                        f"\nLocal origin configured: {_yes_no_unknown(state.remote_configured)}"
+                        f"\nPush completed: {_yes_no_unknown(state.push_succeeded)}"
+                        f"\nPublication verified: {'yes' if state.verified else 'no'}"
+                    )
+                    if state.url:
+                        detail += f"\nRepository URL: {state.url}"
+                    detail += "\n\nInspect this state before retrying. The app will not recreate, replace, or force-push the remote."
+                    message = str(error) + detail
+                else:
+                    title = "GitHub publication incomplete"
+                    message = str(error)
+                messagebox.showerror(title, message)
+                self._offer_open_created_project(result.path)
+
+            self._project_work_active = True
+            self._submit_git(publish_work, published, publish_failed)
+
+        publish_button.configure(command=confirm_publish)
+        publish_button.pack(side="right")
+        cancel_button.pack(side="right", padx=(0, 6))
+        repo_entry.focus_set()
+
+    def _offer_open_created_project(self, path):
+        """Offer VS Code, PowerShell, or no further action for a new folder."""
+        answer = messagebox.askyesnocancel(
+            "Project ready",
+            f"Project folder:\n{path}\n\nYes: open in VS Code.\nNo: open PowerShell here.\nCancel: leave it saved in Developer Launchpad.",
+        )
+        if answer is True:
+            vscode = find_vscode()
+            if not vscode:
+                messagebox.showerror("VS Code not found", "Install VS Code or add its 'code' command to PATH.")
+                return
+            try:
+                open_vscode(path, vscode)
+            except OSError as exc:
+                log_error("Opening created project in VS Code", exc)
+                messagebox.showerror("Could not open VS Code", str(exc))
+        elif answer is False:
+            try:
+                open_terminal(path)
+            except OSError as exc:
+                log_error("Opening terminal for created project", exc)
+                messagebox.showerror("Could not open PowerShell", str(exc))
 
     def remove_project(self):
         project = self._selected_project_record()
@@ -855,6 +1292,7 @@ class DeveloperLaunchpad:
         threading.Thread(target=worker, name="launchpad-git", daemon=True).start()
 
     def _poll_worker_results(self):
+        self._poll_project_progress_events()
         try:
             while True:
                 on_success, result, on_error, error = self._worker_results.get_nowait()
@@ -873,6 +1311,20 @@ class DeveloperLaunchpad:
             pass
         self._poll_command_events()
         self.root.after(100, self._poll_worker_results)
+
+    def _poll_project_progress_events(self):
+        """Display background project/publishing progress only on Tk's thread."""
+        try:
+            while True:
+                message = self._project_progress_events.get_nowait()
+                if self._creation_progress_label is not None:
+                    try:
+                        self._creation_progress_label.config(text=message)
+                    except tk.TclError:
+                        self._creation_progress_label = None
+                self.write_output(message)
+        except queue.Empty:
+            pass
 
     def _sync_busy_controls(self):
         project_locked = self._git_busy or self._command_running
@@ -1411,6 +1863,12 @@ class DeveloperLaunchpad:
         self._sync_busy_controls()
 
     def on_close(self):
+        if getattr(self, "_project_work_active", False):
+            messagebox.showinfo(
+                "Project operation in progress",
+                "Project creation or GitHub publishing is still running and cannot be cancelled safely. Wait for its completion message before closing Developer Launchpad.",
+            )
+            return
         if not self._command_running:
             self._save_window_preferences()
             self._closing = True

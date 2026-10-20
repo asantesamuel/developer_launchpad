@@ -64,6 +64,12 @@ class ProjectCatalogTests(unittest.TestCase):
         self.assertFalse(project_folder_available(missing))
         self.assertTrue(project_folder_available(self.projects[0]))
 
+    def test_malformed_saved_paths_do_not_break_add_or_remove(self):
+        malformed = [{"name": "Bad", "path": "bad\0path"}]
+        added = add_project_shortcut(malformed, "New", str(self.root))
+        self.assertEqual(added["name"], "New")
+        self.assertEqual(remove_project_shortcut(malformed, "bad\0path"), malformed)
+
 
 if __name__ == "__main__":
     unittest.main()

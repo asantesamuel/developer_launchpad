@@ -36,6 +36,14 @@ class ApplicationCallbackTests(unittest.TestCase):
         self.launchpad.stop_running_command.assert_called_once()
         self.assertTrue(self.launchpad._closing)
 
+    def test_close_is_blocked_while_project_creation_or_publishing_cannot_be_cancelled(self):
+        self.launchpad._project_work_active = True
+        with patch.object(app.messagebox, "showinfo") as notice:
+            self.launchpad.on_close()
+        notice.assert_called_once()
+        self.launchpad._save_window_preferences.assert_not_called()
+        self.launchpad.root.destroy.assert_not_called()
+
     def test_navigation_shortcut_selects_the_requested_workspace(self):
         self.launchpad.workspace_tabs = Mock()
         result = self.launchpad._navigate_shortcut(2)

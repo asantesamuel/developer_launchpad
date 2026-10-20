@@ -8,6 +8,16 @@ ALL_CATEGORIES = "All categories"
 ALL_TAGS = "All tags"
 
 
+def _normalized_path(path):
+    """Return a case-normalized resolved path, or None for malformed values."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    try:
+        return os.path.normcase(str(Path(path).expanduser().resolve()))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def project_folder_available(project):
     """Whether a saved path currently points to a directory."""
     path = project.get("path")
@@ -44,7 +54,8 @@ def add_project_shortcut(projects, name, path):
     folder = Path(path).expanduser().resolve()
     if not folder.is_dir():
         raise ValueError(f"Project folder does not exist or is not a folder: {folder}")
-    if any(os.path.normcase(str(Path(item.get("path", "")).resolve())) == os.path.normcase(str(folder)) for item in projects):
+    normalized_folder = _normalized_path(str(folder))
+    if any(_normalized_path(item.get("path")) == normalized_folder for item in projects):
         raise ValueError("That folder is already in your project list.")
     clean_name = name.strip() or folder.name or str(folder)
     return {"name": clean_name, "path": str(folder), "category": "", "tags": []}
@@ -52,8 +63,10 @@ def add_project_shortcut(projects, name, path):
 
 def remove_project_shortcut(projects, path):
     """Return shortcuts other than *path*; project files on disk are untouched."""
-    target = os.path.normcase(str(Path(path).resolve()))
-    return [item for item in projects if os.path.normcase(str(Path(item.get("path", "")).resolve())) != target]
+    target = _normalized_path(str(path))
+    if target is None:
+        return list(projects)
+    return [item for item in projects if _normalized_path(item.get("path")) != target]
 
 
 def clean_labels(values):

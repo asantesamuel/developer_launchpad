@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import unittest
 import os
+import shutil
+import time
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +17,7 @@ from git_operations import GitOperations
 class GitRepositoryTestCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self._cleanup_temp_directory)
         safe_directory = patch.dict(os.environ, {
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "safe.directory",
@@ -30,6 +32,29 @@ class GitRepositoryTestCase(unittest.TestCase):
         self.git(self.repo, "config", "user.name", "Launchpad Test")
         self.git(self.repo, "config", "user.email", "launchpad@example.invalid")
         self.ops = GitOperations(self.repo)
+
+    def _cleanup_temp_directory(self):
+        """Retry transient Windows Git/antivirus directory locks in test data."""
+        target = Path(self.temp.name).resolve()
+        test_root = Path(__file__).resolve().parents[1]
+        if target.parent != test_root or not target.name.startswith("tmp"):
+            raise AssertionError(f"Refusing to clean unexpected test path: {target}")
+        try:
+            self.temp.cleanup()
+        except PermissionError:
+            # TemporaryDirectory's finalizer is already detached, so retry its
+            # exact, validated test path after Windows releases the handle.
+            pass
+        for attempt in range(10):
+            if not target.exists():
+                return
+            try:
+                shutil.rmtree(target)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
 
     @staticmethod
     def git(folder, *args, check=True):

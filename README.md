@@ -16,12 +16,15 @@ Developer Launchpad is a small Windows desktop helper for managing project short
 - Search saved projects by name or path and filter them by categories and tags.
 - View a project dashboard, switch between Git and command workspaces, and choose a light or dark theme.
 - Use keyboard shortcuts, persistent window sizing, and a local diagnostic log.
+- Create a brand-new project folder without overwriting existing folders, generate optional starter files, and initialize a local Git repository.
+- Optionally create an explicit initial commit and publish a new private-by-default GitHub repository through GitHub CLI, with push verification and partial-failure reporting.
 
 ## Requirements
 
 - Python 3.10 or newer is recommended.
 - Tkinter is included with most Windows Python installations.
 - Git for Windows and VS Code are optional; install them to use their respective features.
+- GitHub CLI (`gh`) is optional and is required only when you choose to publish a project to GitHub. Install it from [cli.github.com](https://cli.github.com/) and authenticate with `gh auth login`.
 - There are no third-party Python packages, so no `requirements.txt` or `pip install` step is needed.
 - Install the tools used by the commands you configure (for example Node.js/npm, Python, or the .NET SDK). Launchpad does not install them for you.
 
@@ -48,10 +51,15 @@ Project shortcuts, categories, tags, and command profiles are stored at `%USERPR
 - `command_profiles.py` validates saved command profiles and resolves safe project-relative working directories.
 - `command_runner.py` runs an explicitly requested command off the GUI thread, streams stdout/stderr, and stops the process tree.
 - `project_catalog.py` contains independent project search, filter, category/tag, and shortcut operations.
+- `project_creation.py` validates Windows project names, creates starter files and a local repository, and commits only generated paths.
+- `github_publishing.py` checks GitHub CLI authentication, creates a new remote, pushes without force, verifies the branch commit, and reports partial state.
 - `diagnostics.py` configures local error logging and the Tkinter callback error handler.
 - `tests/test_project_catalog.py`, `tests/test_preferences.py`, and `tests/test_app_preferences.py` cover project discovery, settings, labels, diagnostics, and important window callbacks.
 - `tests/test_command_automation.py` tests profile persistence, input validation, command output, exit codes, cancellation, and GUI queue handling.
 - `tests/test_git_operations.py` exercises Git workflows in disposable local repositories.
+- `tests/test_project_creation.py` uses temporary folders and local Git repositories to test name validation, collisions, initial files/commits, and recovery.
+- `tests/test_github_publishing.py` uses fake CLI/Git responses; it does not contact GitHub.
+- `tests/test_project_creation_gui.py` checks that user choices control whether authentication/publishing starts and that created projects are saved once.
 - `developer_launchpad.py` remains as a compatibility launcher for the original filename.
 
 ## Add an automation
@@ -67,6 +75,46 @@ The theme defaults to **light** and can be changed in Settings. Window geometry 
 `projects.json` remains a JSON list of project objects. New project objects add optional `category` and `tags` fields; older `{name, path}` records continue to work. Preferences use a separate JSON object so theme and window settings do not depend on the installation folder. Unknown preference keys are retained for forward compatibility. Malformed preferences fall back to defaults and are backed up if the user saves new settings. Malformed project rows are skipped when loaded and retained if the list is saved.
 
 Diagnostics are local only. Settings → **View diagnostic log** opens the log in the user profile. Captured development-command output and environment variables are not written to this log.
+
+## Create a project and optionally publish it
+
+Choose **Projects → Create New Project…** (or the **Create New Project…** button in the sidebar). Enter a Windows-safe folder name and choose an existing parent folder. The destination preview updates as you edit the fields. A destination that already exists is refused; the application never merges into it or overwrites it.
+
+Choose whether to generate `README.md` and `.gitignore`. The README contains a heading using the project name and the sentence `Project created with Developer Launchpad.` The default `.gitignore` contains:
+
+```gitignore
+# Local secrets and environment settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python generated files and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node generated dependencies and build output
+node_modules/
+dist/
+build/
+
+# Common operating-system metadata
+.DS_Store
+Thumbs.db
+```
+
+Review this file before adding project-specific files with those names. Source files, dependency lock files, and editor configuration are not excluded by this template. The README and `.gitignore` can be edited normally after creation. You may also create an empty local project with neither file. No framework template or dependency installation is run.
+
+Before creation starts, the app shows the destination and asks for confirmation. It creates a new folder using an exclusive directory-creation operation, generates only the selected files, runs `git init`, and verifies the Git repository root. If requested, it stages and commits only the generated paths. The command uses `git add -- <generated paths>` followed by `git commit --only -m "Initial commit" -- <generated paths>`; it does not use `git add .`. If Git identity is missing, configure it yourself in PowerShell, for example `git config --global user.name "Your Name"` and `git config --global user.email "you@example.com"`. Developer Launchpad does not change global Git configuration. The new project is saved in the Launchpad after the folder exists so partial work remains discoverable; failures state whether Git initialization was verified and the folder is never deleted automatically.
+
+After successful local creation, the app asks whether to publish. **No** keeps it local and performs no network operation. **Cancel** means decide later and also keeps the project local. Choosing **Yes** checks for `gh` and an authenticated GitHub account; the app never asks for or stores credentials. If needed, install GitHub CLI from [cli.github.com](https://cli.github.com/) and run `gh auth login` in PowerShell.
+
+Before remote creation, review the repository name, optional description, visibility, and local path. Visibility defaults to **Private**. Public repositories can be viewed by other people; private repositories follow GitHub's access rules. The app asks for a final confirmation. Publishing runs the equivalent of `gh repo create <name> --private` (or `--public`), gets the authenticated owner using `gh api user --jq .login`, and obtains the URL using `gh repo view <owner>/<name> --json url --jq .url`. It configures `origin` only if no origin exists, pushes the current branch with `git push --set-upstream origin <branch>` (never force), and checks `git remote get-url origin` plus `git ls-remote --heads origin refs/heads/<branch>` to verify the remote branch points to the local commit. It does not modify an existing remote or overwrite a remote repository with the same name; GitHub CLI reports a name collision and the app stops.
+
+If publishing stops after some steps, the error report identifies whether remote creation, local `origin` setup, push, and verification succeeded. A timeout is shown as **unknown** when the remote may have accepted an operation before the timeout. Inspect the provided URL, `git remote -v`, the GitHub repository, and its branch before retrying. The app never automatically repeats repository creation, force-pushes, changes visibility, or deletes remote resources. For an empty project without generated files, create and commit files through the existing Git workflow before publishing. A private or public GitHub account and network access are required for live publishing; automated tests use mocks and do not verify access to a real account.
 
 ## Optional Windows executable
 
