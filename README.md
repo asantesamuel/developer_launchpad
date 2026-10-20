@@ -13,6 +13,9 @@ Developer Launchpad is a small Windows desktop helper for managing project short
 - Fetch from a configured remote without pulling, merging, rebasing, or pushing.
 - Commit staged changes only.
 - Save independent development command profiles for each project, stream their output, and stop long-running processes.
+- Search saved projects by name or path and filter them by categories and tags.
+- View a project dashboard, switch between Git and command workspaces, and choose a light or dark theme.
+- Use keyboard shortcuts, persistent window sizing, and a local diagnostic log.
 
 ## Requirements
 
@@ -33,7 +36,7 @@ python main.py
 
 You can also open the folder in VS Code and run `main.py`, or continue using the old command `python developer_launchpad.py` (it forwards to the same entry point). If your Python Launcher is configured, `py main.py` works too.
 
-The saved project list is stored at `%USERPROFILE%\.developer_launchpad\projects.json`. Removing a project in the app removes only its shortcut.
+Project shortcuts, categories, tags, and command profiles are stored at `%USERPROFILE%\.developer_launchpad\projects.json`. Preferences such as theme and window size are stored separately in `%USERPROFILE%\.developer_launchpad\preferences.json`. Diagnostics stay local at `%USERPROFILE%\.developer_launchpad\developer_launchpad.log`. Removing a project in the app removes only its shortcut, never its folder.
 
 ## Project layout
 
@@ -44,6 +47,9 @@ The saved project list is stored at `%USERPROFILE%\.developer_launchpad\projects
 - `git_operations.py` contains testable Git status, diff, staging, branch, fetch, and commit operations.
 - `command_profiles.py` validates saved command profiles and resolves safe project-relative working directories.
 - `command_runner.py` runs an explicitly requested command off the GUI thread, streams stdout/stderr, and stops the process tree.
+- `project_catalog.py` contains independent project search, filter, category/tag, and shortcut operations.
+- `diagnostics.py` configures local error logging and the Tkinter callback error handler.
+- `tests/test_project_catalog.py`, `tests/test_preferences.py`, and `tests/test_app_preferences.py` cover project discovery, settings, labels, diagnostics, and important window callbacks.
 - `tests/test_command_automation.py` tests profile persistence, input validation, command output, exit codes, cancellation, and GUI queue handling.
 - `tests/test_git_operations.py` exercises Git workflows in disposable local repositories.
 - `developer_launchpad.py` remains as a compatibility launcher for the original filename.
@@ -51,6 +57,29 @@ The saved project list is stored at `%USERPROFILE%\.developer_launchpad\projects
 ## Add an automation
 
 Put a Git workflow in `git_operations.py` so it can be tested without starting the GUI. Add a clearly named handler in `DeveloperLaunchpad` in `app.py`, connect it to a button in `_build_ui()`, and use `_submit_git()` for work that may take time. For a development command, model its saved settings in `command_profiles.py`, keep process execution in `command_runner.py`, and let `app.py` collect runner events from a queue on Tkinter's main thread. Keep profile persistence in `storage.py`.
+
+## Projects, navigation, and preferences
+
+The left sidebar searches project name, path, category, and tags as you type. Use the category and tag dropdowns to narrow the list. **Labels** edits the selected project's category and comma-separated tags; **Manage categories and tags…** lets you add, rename, or remove catalog labels. Removing a label clears that assignment from projects; it never removes project files. The workspace tabs are **Dashboard**, **Git**, **Dev Commands**, and **Settings**. The dashboard shows the selected project's Git snapshot; use **Refresh status** (or F5) when you want an up-to-date read. Recent commits are loaded only on request.
+
+The theme defaults to **light** and can be changed in Settings. Window geometry is saved on close. The UI uses ttk focus behavior, labeled controls, keyboard-focusable buttons, and scrolling lists/output panels. Shortcuts are listed in Settings and in the Projects/Actions menus. Shortcuts that could interfere with normal typing are ignored while an entry or text editor has focus.
+
+`projects.json` remains a JSON list of project objects. New project objects add optional `category` and `tags` fields; older `{name, path}` records continue to work. Preferences use a separate JSON object so theme and window settings do not depend on the installation folder. Unknown preference keys are retained for forward compatibility. Malformed preferences fall back to defaults and are backed up if the user saves new settings. Malformed project rows are skipped when loaded and retained if the list is saved.
+
+Diagnostics are local only. Settings → **View diagnostic log** opens the log in the user profile. Captured development-command output and environment variables are not written to this log.
+
+## Optional Windows executable
+
+The source application has no third-party runtime dependencies. To build an optional one-file Windows executable, install PyInstaller in a project-local virtual environment and run:
+
+```powershell
+cd "D:\Projects\Automations-Python Script\developer_launchpad"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name DeveloperLaunchpad main.py
+```
+
+The executable is written to `dist\DeveloperLaunchpad.exe`. Launch it as a normal user. On the target Windows PC, verify the window opens, preferences remain under `%USERPROFILE%\.developer_launchpad`, and Git/VS Code/development tools can be found through that user's PATH. User project data and credentials are not bundled. PyInstaller is optional and is not a runtime dependency. Packaging was **not run in this environment** because PyInstaller is not installed. Unsigned executables may trigger Microsoft Defender or SmartScreen warnings. If a one-file build causes slow starts or antivirus friction, use one-folder mode by omitting `--onefile`.
 
 ## Development commands
 
@@ -88,9 +117,14 @@ The command-runner tests use harmless invocations of the current Python interpre
 - **VS Code is not found**: install VS Code or add its `code` command to `PATH`.
 - **A project folder is missing**: use the app to remove its stale shortcut and add the folder again when available.
 - **The saved list cannot be read**: the app warns and starts with an empty in-memory list; the original JSON is left in place. Back it up before repairing it manually.
+- **A saved project folder is unavailable**: its shortcut remains visible but the dashboard marks it unavailable. Add the moved folder again with its current path, then remove the stale shortcut; removing it only affects Launchpad.
+- **Preferences are malformed**: Launchpad uses defaults and reports the issue. When you next save preferences, the unreadable file is kept as `preferences.invalid-<timestamp>.json` for recovery.
+- **A setting cannot be saved**: check that `%USERPROFILE%\.developer_launchpad` is writable and inspect Settings → View diagnostic log.
 - **A commit fails after staging**: inspect Git status before retrying, because staging may have completed even though the commit did not.
 - **No upstream is shown**: configure an upstream for that branch in Git; the app does not change remote or upstream configuration.
 - **Fetch fails**: verify the remote exists, network access works, and your Git credentials are available. Fetch never merges the fetched changes.
 - **A development command cannot start**: verify its executable is installed and on `PATH`, and check the displayed project-relative working directory. Arguments must be entered one per line; shell expressions such as pipes and redirection are intentionally not interpreted.
 - **A command returns a nonzero exit code**: read the stderr and stdout output, correct the command or project configuration, and run it again manually.
 - **Stop does not appear to finish**: the app requests termination of the process tree and reports the resulting code. If Windows security software prevents `taskkill`, close the child process from its own terminal or Task Manager; do not force-close Launchpad until you understand which work is running.
+- **The test suite reports a temporary-folder `WinError 32`**: Windows may briefly hold a disposable test repository open after Git exits. Close Explorer/VS Code windows inside the printed `tmp...` path and rerun `python -m unittest discover -s tests -v`; these folders are generated test data, not saved projects.
+- **The executable is blocked or warns**: the optional PyInstaller output is unsigned. Build from source in a trusted local environment, review Windows Defender/SmartScreen details, and consider code signing for distribution.

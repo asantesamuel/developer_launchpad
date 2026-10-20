@@ -231,12 +231,16 @@ class CommandGuiCoordinationTests(unittest.TestCase):
         instance = app.DeveloperLaunchpad.__new__(app.DeveloperLaunchpad)
         project = {"name": "Test", "path": str(Path.cwd()), "commands": [create_profile("Safe", sys.executable).to_dict()]}
         instance.projects = [project]
+        instance._visible_projects = [project]
         instance._command_running = False
         instance.project_list = self.FakeList()
         instance.project_list.selection = [0]
         instance.project_title = self.FakeLabel()
         instance.project_path_label = self.FakeLabel()
         instance.command_status = self.FakeLabel()
+        instance.dashboard_commands_label = self.FakeLabel()
+        instance.dashboard_git_label = self.FakeLabel()
+        instance.git_status_label = self.FakeLabel()
         instance.command_list = self.FakeList()
         instance.command_details_label = self.FakeLabel()
         instance.write_output = Mock()
